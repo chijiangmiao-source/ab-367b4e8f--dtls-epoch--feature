@@ -15,8 +15,19 @@ advance secrets or the current window.
 from __future__ import annotations
 
 import hashlib
+import hmac
 
 from .crypto import TAG_LEN, aead_open, derive_record_keys, ratchet_secret
+
+# Domain-separation key for the one-way traffic-secret fingerprint. Raw
+# traffic secrets never leave the auditor; reviewers compare generations via
+# the HMAC-SHA256 fingerprint instead.
+FINGERPRINT_KEY = b"dtls-audit-epoch-traffic-secret/v1"
+
+
+def secret_fingerprint(secret: bytes) -> str:
+    """Irreversible HMAC-SHA256 fingerprint of a traffic secret (hex)."""
+    return hmac.new(FINGERPRINT_KEY, secret, hashlib.sha256).hexdigest()
 
 # Content types (RFC 8446 §5, RFC 9147 §4.5.2).
 CT_ALERT = 21
@@ -249,6 +260,15 @@ class Receiver:
         self.current = EpochState(initial_epoch, traffic_secret)
         self.previous: EpochState | None = None
         self.ratchets = 0
+        # Generation-evidence chain: the root anchors the initial epoch at
+        # the initial traffic secret; each edge is an authenticated KeyUpdate
+        # that actually advanced receive state. Nothing else may append here.
+        self.root = {
+            "kind": "initial",
+            "epoch": initial_epoch,
+            "secret_fingerprint": secret_fingerprint(traffic_secret),
+        }
+        self.edges: list[dict] = []
 
     def _epoch_for_bits(self, bits: int) -> EpochState | None:
         if bits == (self.current.epoch & 0x03):
@@ -257,14 +277,31 @@ class Receiver:
             return self.previous
         return None
 
-    def _ratchet(self) -> None:
-        """Derive the next epoch's keys and reset its receive window."""
-        next_state = EpochState(self.current.epoch + 1, ratchet_secret(self.current.secret))
-        self.previous = self.current
+    def _ratchet(self, record_index: int, seq: int) -> int:
+        """Derive the next epoch's keys and reset its receive window.
+
+        Records one chain edge for the authenticated KeyUpdate that caused
+        the advance; returns the edge id.
+        """
+        old = self.current
+        edge_id = len(self.edges)
+        next_state = EpochState(old.epoch + 1, ratchet_secret(old.secret))
+        self.edges.append({
+            "edge": edge_id,
+            "kind": "key_update",
+            "record_index": record_index,
+            "seq": seq,
+            "from_epoch": old.epoch,
+            "to_epoch": next_state.epoch,
+            "from_fingerprint": secret_fingerprint(old.secret),
+            "to_fingerprint": secret_fingerprint(next_state.secret),
+        })
+        self.previous = old
         self.current = next_state
         self.ratchets += 1
+        return edge_id
 
-    def process_record(self, data: bytes) -> dict:
+    def process_record(self, data: bytes, record_index: int | None = None) -> dict:
         row = {
             "raw_length": len(data),
             "header": None,
@@ -277,6 +314,7 @@ class Receiver:
             "app_data_sha256": None,
             "handshake_messages": None,
             "key_update": None,
+            "lineage_edge": None,
             "window_before": None,
             "window_after": None,
             "violation": None,
@@ -327,7 +365,7 @@ class Receiver:
             # Authenticated: mark the replay window, then unwrap the inner type.
             state.window.advance(seq)
             row["window_after"] = state.window.snapshot(state.epoch)
-            self._unwrap_inner(row, state, hdr, plaintext)
+            self._unwrap_inner(row, state, hdr, plaintext, record_index, seq)
         except Violation as v:
             row["violation"] = v.as_dict()
         finally:
@@ -337,7 +375,8 @@ class Receiver:
         return row
 
     def _unwrap_inner(self, row: dict, state: EpochState,
-                      hdr: UnifiedHeader, plaintext: bytes) -> None:
+                      hdr: UnifiedHeader, plaintext: bytes,
+                      record_index: int | None, seq: int) -> None:
         """Unwrap DTLSInnerPlaintext; only called after AEAD authentication."""
         if not plaintext:
             raise Violation(KIND_LENGTH, hdr.header_len,
@@ -373,8 +412,10 @@ class Receiver:
                     # Legal KeyUpdate: authenticated above, so now ratchet the
                     # secret into the next epoch and reset the receive window.
                     for _ in key_updates:
-                        self._ratchet()
+                        edge_id = self._ratchet(
+                            record_index if record_index is not None else -1, seq)
                     row["key_update"] = "processed"
+                    row["lineage_edge"] = edge_id
                 else:
                     # Old-epoch records never advance secrets or windows.
                     row["key_update"] = "ignored_old_epoch"
@@ -396,6 +437,132 @@ class Receiver:
             "epochs": epochs,
         }
 
+    def lineage(self) -> dict:
+        """The authenticated generation chain: initial root + KeyUpdate edges.
+
+        Only edges for KeyUpdates that authenticated AND advanced receive
+        state are present; failed, duplicate, too-old, old-epoch, malformed
+        or otherwise non-advancing records never appear here.
+        """
+        return {
+            "initial_epoch": self.root["epoch"],
+            "root": dict(self.root),
+            "edges": [dict(e) for e in self.edges],
+        }
+
+    def established_epochs(self) -> set[int]:
+        epochs = {self.root["epoch"]}
+        epochs.update(e["to_epoch"] for e in self.edges)
+        return epochs
+
+
+def epoch_evidence(lineage: dict, epoch: int) -> dict:
+    """Build the provenance view for one established epoch.
+
+    The path runs in advancement order from the initial root through the
+    chain edges up to the epoch's receiving secret; every edge's source
+    fingerprint must match the preceding node's fingerprint.
+    """
+    root = lineage["root"]
+    edges = lineage["edges"]
+    nodes = [{
+        "kind": "initial",
+        "epoch": root["epoch"],
+        "secret_fingerprint": root["secret_fingerprint"],
+    }]
+    path_edges = []
+    for edge in edges:
+        if edge["to_epoch"] > epoch:
+            break
+        prev_fp = (root["secret_fingerprint"] if not path_edges
+                   else path_edges[-1]["to_fingerprint"])
+        path_edges.append({
+            **edge,
+            "linked": hmac.compare_digest(edge["from_fingerprint"], prev_fp),
+        })
+        nodes.append({
+            "kind": "epoch",
+            "epoch": edge["to_epoch"],
+            "secret_fingerprint": edge["to_fingerprint"],
+            "established_by": edge["edge"],
+        })
+    establishing = path_edges[-1] if path_edges else None
+    return {
+        "epoch": epoch,
+        "origin": ("initial_traffic_secret" if epoch == root["epoch"]
+                   else "authenticated_key_update"),
+        "path_length_edges": len(path_edges),
+        "nodes": nodes,
+        "edges": path_edges,
+        "establishing_edge": establishing["edge"] if establishing else None,
+        "establishing_record_index": (
+            establishing["record_index"] if establishing else None),
+        "establishing_record_seq": establishing["seq"] if establishing else None,
+    }
+
+
+def chain_boundary(rows: list[dict], lineage_edges: list[dict],
+                   blobs: list[bytes] | None = None) -> list[dict]:
+    """Records that could be mistaken for chain edges but are not.
+
+    The evidence chain only admits authenticated KeyUpdates that advanced
+    receive state. Every excluded record that could otherwise be confused
+    with a chain edge is reported here with the exclusion reason so the
+    failure boundary is reviewable:
+      * authentication_failed     — tag check failed; the inner content was
+                                    never unwrapped, so a forged KeyUpdate
+                                    cannot be distinguished from any other
+                                    forgery and all such failures are listed
+      * old_epoch_not_advanced    — authenticated KeyUpdate in a superseded
+                                    epoch; the secret chain must not move
+      * authenticated_not_advanced— authenticated but a state violation
+                                    (malformed body / epoch overflow)
+      * replayed_key_update       — duplicate/too-old delivery of the exact
+                                    bytes of a record already on the chain;
+                                    dropped before decryption, never re-applied
+    Other duplicate/too-old records stay out: dropped before decryption,
+    their content cannot be claimed as KeyUpdates.
+    """
+    edge_records = {e["record_index"] for e in lineage_edges}
+    edge_bytes: dict[bytes, int] = {}
+    if blobs is not None:
+        for idx in edge_records:
+            edge_bytes[blobs[idx]] = idx
+    boundary = []
+    for row in rows:
+        if row["index"] in edge_records:
+            continue
+        reason = None
+        violation = row.get("violation")
+        msgs = row.get("handshake_messages") or []
+        has_ku = any(m.get("type") == "key_update" for m in msgs)
+        if has_ku and row.get("key_update") == "ignored_old_epoch":
+            reason = "old_epoch_not_advanced"
+        elif has_ku and violation is not None:
+            # Authenticated but rejected as a state violation (malformed
+            # body, epoch overflow): the replay window marked the sequence
+            # received but the secret chain was deliberately not advanced.
+            reason = "authenticated_not_advanced"
+        elif violation is not None and violation["kind"] == KIND_AUTHENTICATION:
+            # Content could not be authenticated/unwrapped; a forged
+            # KeyUpdate is indistinguishable from any other forgery here.
+            reason = "authentication_failed"
+        elif (row.get("replay") in ("duplicate", "too_old")
+                and blobs is not None and blobs[row["index"]] in edge_bytes):
+            reason = "replayed_key_update"
+        if reason is not None:
+            boundary.append({
+                "record_index": row["index"],
+                "epoch": row["epoch"],
+                "seq": row["seq"],
+                "reason": reason,
+                "replay": row["replay"],
+                "replay_of_edge": (edge_bytes.get(blobs[row["index"]])
+                                   if blobs is not None else None),
+                "violation": violation,
+            })
+    return boundary
+
 
 def run_audit(initial_epoch: int, traffic_secret: bytes,
               record_blobs: list[bytes]) -> dict:
@@ -404,14 +571,17 @@ def run_audit(initial_epoch: int, traffic_secret: bytes,
     rows = []
     first_violation = None
     for index, blob in enumerate(record_blobs):
-        row = receiver.process_record(blob)
+        row = receiver.process_record(blob, record_index=index)
         row["index"] = index
         rows.append(row)
         if row["violation"] is not None and first_violation is None:
             first_violation = {"record_index": index, **row["violation"]}
+    lineage = receiver.lineage()
     return {
         "ok": first_violation is None,
         "first_violation": first_violation,
         "records": rows,
         "final_state": receiver.final_state(),
+        "lineage": lineage,
+        "chain_boundary": chain_boundary(rows, lineage["edges"], record_blobs),
     }

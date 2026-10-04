@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from .dtls import run_audit
+from .dtls import epoch_evidence, run_audit
 
 MAX_RECORDS = 48
 MAX_RECORD_BYTES = 16640  # 2^14 plaintext + header + padding + tag headroom
@@ -81,3 +81,51 @@ def reopen_audit(audit_id: str) -> dict:
     if verdict is None:
         raise HTTPException(404, "no frozen verdict for this audit id")
     return verdict
+
+
+@app.get("/api/audit/{audit_id}/epoch/{epoch}")
+def epoch_generation_evidence(audit_id: str, epoch: int) -> dict:
+    """Generation-evidence view for one established epoch of a frozen audit.
+
+    Refuses explicitly when the audit is unknown/frozen elsewhere, or the
+    epoch was never established by the initial secret or an authenticated
+    KeyUpdate edge. No raw traffic secret is ever returned; generations are
+    identified by irreversible fingerprints only.
+    """
+    verdict = VERDICTS.get(audit_id)
+    if verdict is None:
+        # Same opaque refusal as the reopen endpoint: no evidence from any
+        # other audit is disclosed.
+        raise HTTPException(404, "no frozen verdict for this audit id")
+    if not 0 <= epoch <= 65535:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "epoch_out_of_range",
+                "message": "epoch must be in 0..65535",
+                "audit_id": audit_id,
+                "epoch": epoch,
+            },
+        )
+    lineage = verdict["lineage"]
+    established = {lineage["root"]["epoch"]}
+    established.update(e["to_epoch"] for e in lineage["edges"])
+    if epoch not in established:
+        raise HTTPException(
+            404,
+            detail={
+                "error": "epoch_not_established",
+                "message": ("epoch was never established by the initial "
+                            "traffic secret or an authenticated KeyUpdate"),
+                "audit_id": audit_id,
+                "epoch": epoch,
+                "established_epochs": sorted(established),
+            },
+        )
+    return {
+        "audit_id": audit_id,
+        "epoch": epoch,
+        "evidence": epoch_evidence(lineage, epoch),
+        "established_epochs": sorted(established),
+        "chain_boundary": verdict["chain_boundary"],
+    }

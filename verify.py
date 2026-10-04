@@ -46,6 +46,9 @@ def build_checks():
             html = fh.read()
         check("page contains audit form",
               all(token in html for token in ("audit_id", "traffic_secret", "records")))
+        check("page contains epoch evidence view",
+              all(token in html for token in
+                  ("epoch-select", "/epoch/", "世代证据", "失败边界")))
     except OSError as exc:
         check("page contains audit form", False, repr(exc))
 
@@ -226,6 +229,128 @@ def smoke_tests():
     check("length: kind and raw offset reported",
           status == 200 and fv.get("kind") == "length" and fv.get("offset") == 3,
           f"{status} {fv}")
+
+    # --- scenario E: epoch generation evidence along a continuous chain ---
+    from server.dtls import secret_fingerprint
+    secret5 = ratchet_secret(secret4)
+
+    edge0 = key_update_record(secret3, 3, 1, request_update=0)
+    edge1 = key_update_record(secret4, 4, 1, request_update=0)
+    forged_ku = bytearray(key_update_record(secret3, 3, 5))
+    forged_ku[-1] ^= 0x80  # forged KeyUpdate: authentication failure
+    # Boundary records must arrive while epoch 3 is still the retained
+    # previous epoch (current == 4); after the next ratchet the auditor
+    # retains only epoch 4, exactly as DTLS requires.
+    records = [
+        app(0, b"before"),                       # epoch 3 app data
+        edge0,                                   # authenticated KeyUpdate #1: 3 -> 4
+        bytes(forged_ku),                        # forged KeyUpdate, auth failure
+        edge0,                                   # exact replay of edge #0 -> duplicate
+        key_update_record(secret3, 3, 9),        # authenticated, but old epoch
+        edge1,                                   # authenticated KeyUpdate #2: 4 -> 5
+        seal_record(secret5, 5, 0, b"after-1", 23),
+    ]
+
+    status, v = post_audit("smoke-lineage", secret_hex, records)
+    ok = status == 200
+    check("lineage: chain submission accepted", ok, f"{status} {json.dumps(v)[:200]}")
+    if ok:
+        lineage = v["lineage"]
+        check("lineage: root anchors initial epoch with fingerprint only",
+              lineage["root"]["epoch"] == 3
+              and lineage["root"]["secret_fingerprint"] == secret_fingerprint(secret3)
+              and "secret" not in lineage["root"])
+        edges = lineage["edges"]
+        check("lineage: exactly two edges in advancement order",
+              [(e["edge"], e["from_epoch"], e["to_epoch"], e["record_index"], e["seq"])
+               for e in edges]
+              == [(0, 3, 4, 1, 1), (1, 4, 5, 5, 1)],
+              json.dumps(edges))
+        check("lineage: fingerprints are one-way and adjacent",
+              edges[0]["from_fingerprint"] == secret_fingerprint(secret3)
+              and edges[0]["to_fingerprint"] == secret_fingerprint(secret4)
+              and edges[1]["to_fingerprint"] == secret_fingerprint(secret5)
+              and secret_hex not in json.dumps(lineage))
+        rows = v["records"]
+        check("lineage: only the advancing rows carry an edge id",
+              rows[1]["lineage_edge"] == 0 and rows[5]["lineage_edge"] == 1
+              and all(rows[i].get("lineage_edge") is None
+                      for i in (0, 2, 3, 4, 6)))
+
+    # epoch 3: derived straight from the initial traffic secret
+    status, e3 = http("GET", "/api/audit/smoke-lineage/epoch/3")
+    check("lineage: epoch 3 evidence origin is initial secret",
+          status == 200
+          and e3["evidence"]["origin"] == "initial_traffic_secret"
+          and e3["evidence"]["path_length_edges"] == 0
+          and e3["evidence"]["establishing_edge"] is None
+          and e3["established_epochs"] == [3, 4, 5],
+          f"{status} {json.dumps(e3)[:200]}")
+
+    # epoch 4: one authenticated KeyUpdate edge
+    status, e4 = http("GET", "/api/audit/smoke-lineage/epoch/4")
+    check("lineage: epoch 4 evidence traces to KeyUpdate record #1 seq 1",
+          status == 200
+          and e4["evidence"]["origin"] == "authenticated_key_update"
+          and e4["evidence"]["path_length_edges"] == 1
+          and e4["evidence"]["establishing_record_index"] == 1
+          and e4["evidence"]["establishing_record_seq"] == 1
+          and e4["evidence"]["edges"][0]["linked"] is True
+          and [n["epoch"] for n in e4["evidence"]["nodes"]] == [3, 4],
+          f"{status} {json.dumps(e4)[:200]}")
+
+    # epoch 5: continuous two-edge chain; later epochs must not leak into it
+    status, e5 = http("GET", "/api/audit/smoke-lineage/epoch/5")
+    check("lineage: epoch 5 evidence is a continuous two-edge chain",
+          status == 200 and e5["evidence"]["path_length_edges"] == 2
+          and [n["epoch"] for n in e5["evidence"]["nodes"]] == [3, 4, 5]
+          and all(x["linked"] for x in e5["evidence"]["edges"])
+          and e5["evidence"]["establishing_record_index"] == 5,
+          f"{status} {json.dumps(e5)[:200]}")
+
+    # failure boundary: forged / replayed / old-epoch records are kept out
+    boundary = (e5 or {}).get("chain_boundary", [])
+    reasons = {b["record_index"]: b["reason"] for b in boundary}
+    check("lineage: failure boundary excludes non-edges with reasons",
+          reasons.get(2) == "authentication_failed"
+          and reasons.get(3) == "replayed_key_update"
+          and reasons.get(4) == "old_epoch_not_advanced"
+          and set(reasons).isdisjoint({1, 5}),
+          json.dumps(boundary, ensure_ascii=False))
+
+    # refusals: FastAPI wraps error bodies as {"detail": ...}
+    status, body = http("GET", "/api/audit/no-such-audit/epoch/3")
+    detail = body.get("detail") if isinstance(body, dict) else body
+    check("lineage: unknown audit refused like reopen (no other-audit leak)",
+          status == 404 and detail == "no frozen verdict for this audit id",
+          f"{status} {body}")
+    status, body = http("GET", "/api/audit/smoke-lineage/epoch/6")
+    detail = body.get("detail") if isinstance(body, dict) else body
+    check("lineage: unestablished epoch explicitly refused",
+          status == 404 and isinstance(detail, dict)
+          and detail.get("error") == "epoch_not_established"
+          and detail.get("established_epochs") == [3, 4, 5]
+          and detail.get("audit_id") == "smoke-lineage",
+          f"{status} {body}")
+    status, body = http("GET", "/api/audit/smoke-lineage/epoch/70000")
+    detail = body.get("detail") if isinstance(body, dict) else body
+    check("lineage: out-of-range epoch refused", status == 400
+          and isinstance(detail, dict) and detail.get("error") == "epoch_out_of_range",
+          f"{status} {body}")
+
+    # no raw traffic secret anywhere in the evidence responses
+    leak = secret_hex in json.dumps(e3) + json.dumps(e4) + json.dumps(e5)
+    check("lineage: raw traffic secret absent from evidence responses", not leak)
+
+    # resubmission replaces the lineage: epoch 4 evidence must disappear
+    status, _ = post_audit("smoke-lineage", secret_hex, [app(0)])
+    status, body = http("GET", "/api/audit/smoke-lineage/epoch/4")
+    detail = body.get("detail") if isinstance(body, dict) else body
+    check("lineage: old edge evidence cleared on resubmission",
+          status == 404 and isinstance(detail, dict)
+          and detail.get("error") == "epoch_not_established"
+          and detail.get("established_epochs") == [3],
+          f"{status} {body}")
 
 
 def main():

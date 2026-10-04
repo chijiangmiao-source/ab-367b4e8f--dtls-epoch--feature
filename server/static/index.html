@@ -46,6 +46,34 @@
   .tag.fail { background: #33131c; color: #ffb3c0; }
   .tag.skip { background: #1a1f2e; color: #7f8db3; }
   .tag.okb  { background: #0f2f1e; color: #8ff0b8; }
+  .tag.edge { background: #10243f; color: #7cc4ff; }
+  #lineage-panel { margin: 0 24px 24px; background: #121a30;
+                   border: 1px solid #26314f; border-radius: 10px; padding: 14px 16px; }
+  #lineage-panel h2 { font-size: 15px; margin: 0 0 6px; color: #9db4e8; }
+  #lineage-panel h3 { font-size: 13px; margin: 16px 0 6px; color: #9db4e8; }
+  #lineage-panel p.lineage-hint { font-size: 11.5px; color: #6f80ab; margin: 2px 0 10px; }
+  select { background: #0b1226; color: #dbe4ff; border: 1px solid #33406b;
+           border-radius: 6px; padding: 7px; font-family: ui-monospace, Consolas, monospace;
+           font-size: 12px; }
+  #epoch-query { margin-top: 0; padding: 7px 14px; }
+  #epoch-error { color: #ff9090; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  .origin-banner { border-radius: 8px; padding: 10px 14px; margin: 10px 0;
+                   font-size: 12.5px; font-family: ui-monospace, Consolas, monospace; }
+  .origin-banner.initial { background: #0f2a2f; border: 1px solid #2a8a99; color: #9fe9f2; }
+  .origin-banner.ku      { background: #10203f; border: 1px solid #3a6fd8; color: #a9c8ff; }
+  .chain { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+           margin: 8px 0; }
+  .chain .node { padding: 6px 10px; border-left: 3px solid #4a7bd8; margin-left: 6px; }
+  .chain .node.initial { border-left-color: #2a99aa; }
+  .chain .edge-line { color: #8fa3d0; margin: 3px 0 3px 22px; }
+  .fp { color: #c3d3ff; }
+  .fp-sep { color: #6f80ab; }
+  .link-ok { color: #8ff0b8; }
+  .link-bad { color: #ff9090; }
+  .reason-auth { color: #ffb3c0; }
+  .reason-old  { color: #ffd27a; }
+  .reason-noadv{ color: #e0b0ff; }
+  .reason-rep  { color: #aaaaaa; }
 </style>
 </head>
 <body>
@@ -103,6 +131,23 @@
   </div>
 </section>
 
+<section id="lineage-panel" hidden>
+  <h2>世代证据 · 接收密钥来源链</h2>
+  <p class="lineage-hint">
+    选择一个已出现的 epoch，追查其接收密钥究竟源于初始 traffic secret 还是哪条
+    <strong>认证成功且实际推进接收状态</strong>的 KeyUpdate。链上仅含这类边；
+    认证失败、重复、过旧、旧 epoch 或未推进状态的记录即使携带 KeyUpdate 内容也不得入链，
+    统一列在“失败边界”。页面与接口只显示不可逆指纹（HMAC-SHA256），不显示原始 traffic secret。
+  </p>
+  <div>
+    <label for="epoch-select" style="display:inline;margin-right:8px">选择已建立的 epoch</label>
+    <select id="epoch-select"></select>
+    <button id="epoch-query">追查该 epoch 的密钥世代</button>
+  </div>
+  <div id="epoch-error"></div>
+  <div id="epoch-view"></div>
+</section>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const KIND_ZH = {truncation: "截断", length: "长度", authentication: "认证", state: "状态"};
@@ -117,6 +162,10 @@ function esc(s) {
 // 渲染新结果前清空旧成功证据
 function clearResult() {
   $("result").hidden = true;
+  $("lineage-panel").hidden = true;
+  $("epoch-select").innerHTML = "";
+  $("epoch-view").innerHTML = "";
+  $("epoch-error").textContent = "";
   $("v-banner").className = "banner";
   $("v-banner").textContent = "";
   $("v-final").textContent = "";
@@ -169,7 +218,7 @@ function renderVerdict(v) {
       ? `<span class="tag ${r.auth === "ok" ? "okb" : r.auth === "failed" ? "fail" : "skip"}">${AUTH_ZH[r.auth]}</span>`
       : "—";
     let inner = r.inner_type ? esc(r.inner_type) : "—";
-    if (r.key_update === "processed") inner += " · KeyUpdate✔已推进";
+    if (r.key_update === "processed") inner += " · <span class=\"tag edge\">KeyUpdate✔已推进·链边#" + r.lineage_edge + "</span>";
     if (r.key_update === "ignored_old_epoch") inner += " · KeyUpdate✘旧epoch忽略";
     const digest = r.app_data_sha256
       ? `<span title="${r.app_data_sha256}">${r.app_data_sha256.slice(0, 16)}…</span>（${r.inner_length}B）`
@@ -188,7 +237,112 @@ function renderVerdict(v) {
   }).join("");
   $("v-rows").innerHTML = rows;
   $("result").hidden = false;
+  renderLineagePanel(v);
   $("result").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+// ------------------------------------------------------- 世代证据（epoch 链）
+const REASON_ZH = {
+  authentication_failed: "认证失败（内容未解开，疑似伪造）",
+  old_epoch_not_advanced: "认证成功但处于旧 epoch，未推进状态",
+  authenticated_not_advanced: "认证成功但 KeyUpdate 畸形/状态违规，未推进",
+  replayed_key_update: "链上 KeyUpdate 的重复/过旧投递，解密前丢弃",
+};
+
+function fpHtml(fp) {
+  // 指纹不可逆，分段展示便于逐字节比对
+  return `<span class="fp">${esc(fp.slice(0, 16))}<span class="fp-sep">…</span>${esc(fp.slice(-16))}</span>`;
+}
+
+function renderLineagePanel(v) {
+  const lineage = v.lineage || {root: {}, edges: []};
+  const epochs = [lineage.root.epoch].concat(lineage.edges.map(e => e.to_epoch));
+  const sel = $("epoch-select");
+  sel.innerHTML = epochs.map(e =>
+    `<option value="${e}">epoch ${e}${e === lineage.root.epoch ? "（初始）" : ""}</option>`).join("");
+  $("epoch-view").innerHTML = "";
+  $("epoch-error").textContent = "";
+  $("lineage-panel").hidden = false;
+  // 默认追查最终（当前）epoch 的来源
+  queryEpoch(v.audit_id, epochs[epochs.length - 1]);
+}
+
+function renderEpochView(payload) {
+  const ev = payload.evidence;
+  const originZh = ev.origin === "initial_traffic_secret"
+    ? `接收密钥直接源于<strong>初始 traffic secret</strong>（0 条 KeyUpdate 边）`
+    : `接收密钥源于 <strong>${ev.path_length_edges} 条已认证 KeyUpdate</strong> 链 — ` +
+      `建立边 #${ev.establishing_edge}（记录 #${ev.establishing_record_index}，` +
+      `该 epoch 内记录序号 ${ev.establishing_record_seq}）`;
+  let html = `<div class="origin-banner ${ev.origin === "initial_traffic_secret" ? "initial" : "ku"}">` +
+    `epoch ${ev.epoch} 的接收密钥来源：${originZh}</div>`;
+  html += `<h3>密钥世代链（按推进顺序，仅含认证成功且实际推进的 KeyUpdate）</h3><div class="chain">`;
+  ev.nodes.forEach((node, i) => {
+    if (i === 0) {
+      html += `<div class="node initial">▣ 初始 epoch ${node.epoch}` +
+        ` — traffic secret 指纹 ${fpHtml(node.secret_fingerprint)}</div>`;
+    } else {
+      const edge = ev.edges[i - 1];
+      html += `<div class="edge-line">↑ 边 #${edge.edge} · ` +
+        `KeyUpdate 记录 #${edge.record_index} · epoch ${edge.from_epoch} 内序号 ${edge.seq} · ` +
+        `epoch ${edge.from_epoch} → ${edge.to_epoch} · ` +
+        (edge.linked
+          ? `<span class="link-ok">前后指纹衔接✔</span>`
+          : `<span class="link-bad">前后指纹断裂✘</span>`) + `</div>`;
+      html += `<div class="node">▣ epoch ${node.epoch}` +
+        ` — 接收 traffic secret 指纹 ${fpHtml(node.secret_fingerprint)}</div>`;
+    }
+  });
+  html += `</div>`;
+  const boundary = payload.chain_boundary || [];
+  html += `<h3>失败边界（携带类 KeyUpdate 内容但不得入链的记录，共 ${boundary.length} 条）</h3>`;
+  if (boundary.length === 0) {
+    html += `<p class="lineage-hint">无失败边界：捕获中所有疑似 KeyUpdate 均为链上边。</p>`;
+  } else {
+    html += `<div class="tablewrap"><table><thead><tr>` +
+      `<th>记录 #</th><th>epoch</th><th>序号</th><th>重放裁定</th><th>排除原因</th>` +
+      `</tr></thead><tbody>` +
+      boundary.map(b => `<tr class="violation"><td>${b.record_index}</td>` +
+        `<td>${b.epoch ?? "—"}</td><td>${b.seq ?? "—"}</td>` +
+        `<td>${REPLAY_ZH[b.replay] || b.replay || "—"}</td>` +
+        `<td class="reason-${b.reason === "authentication_failed" ? "auth"
+            : b.reason === "old_epoch_not_advanced" ? "old"
+            : b.reason === "replayed_key_update" ? "rep" : "noadv"}">` +
+        `${REASON_ZH[b.reason] || b.reason}` +
+        (b.replay_of_edge != null ? `（链边记录 #${b.replay_of_edge} 的重放）` : "") +
+        (b.violation ? ` — ${KIND_ZH[b.violation.kind] || b.violation.kind}@${b.violation.offset}` : "") +
+        `</td></tr>`).join("");
+    html += `</tbody></table></div>`;
+  }
+  $("epoch-view").innerHTML = html;
+}
+
+async function queryEpoch(auditId, epoch) {
+  $("epoch-error").textContent = "";
+  $("epoch-view").innerHTML = "";
+  let resp;
+  try {
+    resp = await fetch(`/api/audit/${encodeURIComponent(auditId)}/epoch/${Number(epoch)}`);
+  } catch (e) {
+    $("epoch-error").textContent = "网络错误：" + e;
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    const d = data && data.detail;
+    let msg = `服务明确拒绝（HTTP ${resp.status}）：`;
+    if (d && typeof d === "object") {
+      msg += d.message || d.error || JSON.stringify(d);
+      if (Array.isArray(d.established_epochs)) {
+        msg += "；该冻结审计已建立的 epoch 仅有 " + d.established_epochs.join(", ");
+      }
+    } else {
+      msg += (typeof d === "string" ? d : "该审计不存在、epoch 未建立或不属于此冻结审计");
+    }
+    $("epoch-error").textContent = msg;
+    return;
+  }
+  renderEpochView(data);
 }
 
 async function submitAudit() {
@@ -246,6 +400,14 @@ async function reopenAudit() {
 
 $("submit").addEventListener("click", submitAudit);
 $("reopen").addEventListener("click", reopenAudit);
+$("epoch-query").addEventListener("click", () => {
+  const id = $("v-audit").textContent;
+  queryEpoch(id, $("epoch-select").value);
+});
+$("epoch-select").addEventListener("change", () => {
+  const id = $("v-audit").textContent;
+  queryEpoch(id, $("epoch-select").value);
+});
 </script>
 </body>
 </html>
