@@ -60,6 +60,18 @@ def ratchet_secret(traffic_secret: bytes) -> bytes:
     return hkdf_expand_label(traffic_secret, "traffic upd", b"", HASH_LEN)
 
 
+def secret_fingerprint(traffic_secret: bytes) -> str:
+    """Irreversible, domain-separated fingerprint of a traffic secret.
+
+    Generation-evidence chains and audit pages only ever show this digest;
+    the raw traffic secret itself never appears in a response or page.
+    """
+    if len(traffic_secret) != HASH_LEN:
+        raise ValueError("traffic secret must be 32 bytes")
+    return hashlib.sha256(
+        b"dtls13-secret-fingerprint\x00" + traffic_secret).hexdigest()
+
+
 def record_nonce(iv: bytes, seq: int) -> bytes:
     """RFC 8446 §5.3: static IV XOR the 64-bit record sequence number."""
     padded = b"\x00" * (IV_LEN - 8) + seq.to_bytes(8, "big")

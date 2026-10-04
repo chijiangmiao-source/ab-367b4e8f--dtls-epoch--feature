@@ -11,12 +11,25 @@ adjudicates every record as new / duplicate / too_old. A legal KeyUpdate is
 authenticated first and only then ratchets the secret into the next epoch and
 resets the receive window. Failed, duplicate, or old-epoch records never
 advance secrets or the current window.
+
+Every actual ratchet also appends to a key-generation lineage: which record
+established the successor epoch, from which epoch, and the irreversible
+fingerprint of the new secret. That chain lets a reviewer trace whether an
+epoch's receive key stems from the initial traffic secret or from a specific
+authenticated KeyUpdate; records that failed authentication, were duplicates
+or too old, or never advanced the receive state leave no edge behind.
 """
 from __future__ import annotations
 
 import hashlib
 
-from .crypto import TAG_LEN, aead_open, derive_record_keys, ratchet_secret
+from .crypto import (
+    TAG_LEN,
+    aead_open,
+    derive_record_keys,
+    ratchet_secret,
+    secret_fingerprint,
+)
 
 # Content types (RFC 8446 §5, RFC 9147 §4.5.2).
 CT_ALERT = 21
@@ -241,7 +254,12 @@ def parse_handshake_messages(content: bytes, offset_base: int) -> list[tuple[int
 
 
 class Receiver:
-    """Single-direction DTLS 1.3 receive state machine."""
+    """Single-direction DTLS 1.3 receive state machine.
+
+    Also tracks the key-generation lineage: for every epoch established on
+    this connection, whether its receive secret is the initial traffic
+    secret or was ratcheted in by a specific authenticated KeyUpdate.
+    """
 
     def __init__(self, initial_epoch: int, traffic_secret: bytes):
         if not 0 <= initial_epoch <= MAX_EPOCH:
@@ -249,6 +267,16 @@ class Receiver:
         self.current = EpochState(initial_epoch, traffic_secret)
         self.previous: EpochState | None = None
         self.ratchets = 0
+        # Generation evidence, in advancement order. Only _ratchet appends
+        # here, so every edge beyond the initial hop marks an authenticated
+        # KeyUpdate that actually advanced the receive state.
+        self.lineage: list[dict] = [{
+            "epoch": initial_epoch,
+            "source": "initial_traffic_secret",
+            "record_index": None,
+            "from_epoch": None,
+            "secret_fingerprint": secret_fingerprint(traffic_secret),
+        }]
 
     def _epoch_for_bits(self, bits: int) -> EpochState | None:
         if bits == (self.current.epoch & 0x03):
@@ -257,14 +285,25 @@ class Receiver:
             return self.previous
         return None
 
-    def _ratchet(self) -> None:
-        """Derive the next epoch's keys and reset its receive window."""
+    def _ratchet(self, record_index: int | None) -> None:
+        """Derive the next epoch's keys and reset its receive window.
+
+        Only reached for an authenticated, current-epoch KeyUpdate, so the
+        lineage edge appended here always marks a real state advancement.
+        """
         next_state = EpochState(self.current.epoch + 1, ratchet_secret(self.current.secret))
         self.previous = self.current
         self.current = next_state
         self.ratchets += 1
+        self.lineage.append({
+            "epoch": next_state.epoch,
+            "source": "key_update",
+            "record_index": record_index,
+            "from_epoch": self.previous.epoch,
+            "secret_fingerprint": secret_fingerprint(next_state.secret),
+        })
 
-    def process_record(self, data: bytes) -> dict:
+    def process_record(self, data: bytes, record_index: int | None = None) -> dict:
         row = {
             "raw_length": len(data),
             "header": None,
@@ -327,7 +366,7 @@ class Receiver:
             # Authenticated: mark the replay window, then unwrap the inner type.
             state.window.advance(seq)
             row["window_after"] = state.window.snapshot(state.epoch)
-            self._unwrap_inner(row, state, hdr, plaintext)
+            self._unwrap_inner(row, state, hdr, plaintext, record_index)
         except Violation as v:
             row["violation"] = v.as_dict()
         finally:
@@ -337,7 +376,8 @@ class Receiver:
         return row
 
     def _unwrap_inner(self, row: dict, state: EpochState,
-                      hdr: UnifiedHeader, plaintext: bytes) -> None:
+                      hdr: UnifiedHeader, plaintext: bytes,
+                      record_index: int | None = None) -> None:
         """Unwrap DTLSInnerPlaintext; only called after AEAD authentication."""
         if not plaintext:
             raise Violation(KIND_LENGTH, hdr.header_len,
@@ -373,7 +413,7 @@ class Receiver:
                     # Legal KeyUpdate: authenticated above, so now ratchet the
                     # secret into the next epoch and reset the receive window.
                     for _ in key_updates:
-                        self._ratchet()
+                        self._ratchet(record_index)
                     row["key_update"] = "processed"
                 else:
                     # Old-epoch records never advance secrets or windows.
@@ -396,6 +436,20 @@ class Receiver:
             "epochs": epochs,
         }
 
+    def lineage_snapshot(self) -> dict:
+        """Frozen generation evidence for every epoch established so far.
+
+        Hops are in advancement order, starting with the initial epoch; each
+        later hop is an authenticated KeyUpdate that actually advanced the
+        receive state. Only irreversible secret fingerprints are exposed.
+        """
+        return {
+            "initial_epoch": self.lineage[0]["epoch"],
+            "established_epochs": [hop["epoch"] for hop in self.lineage],
+            "chain": [dict(hop, order=order)
+                      for order, hop in enumerate(self.lineage)],
+        }
+
 
 def run_audit(initial_epoch: int, traffic_secret: bytes,
               record_blobs: list[bytes]) -> dict:
@@ -404,7 +458,7 @@ def run_audit(initial_epoch: int, traffic_secret: bytes,
     rows = []
     first_violation = None
     for index, blob in enumerate(record_blobs):
-        row = receiver.process_record(blob)
+        row = receiver.process_record(blob, record_index=index)
         row["index"] = index
         rows.append(row)
         if row["violation"] is not None and first_violation is None:
@@ -414,4 +468,8 @@ def run_audit(initial_epoch: int, traffic_secret: bytes,
         "first_violation": first_violation,
         "records": rows,
         "final_state": receiver.final_state(),
+        # Generation evidence for the epoch-evidence endpoint only; the
+        # service layer pops this so the frozen verdict keeps its original
+        # shape on every pre-existing interface.
+        "key_lineage": receiver.lineage_snapshot(),
     }

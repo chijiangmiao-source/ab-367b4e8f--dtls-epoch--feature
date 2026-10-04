@@ -4,8 +4,9 @@
 Runs, in order:
   1. build checks        — byte-compile the app, import it, sanity-check the page
   2. review-rule tests   — the unittest suite (replay window, KeyUpdate, vectors)
-  3. HTTP smoke tests    — live API checks of the KeyUpdate ratchet and the
-                           replay-window boundary against APP_BASE_URL
+  3. HTTP smoke tests    — live API checks of the KeyUpdate ratchet, the
+                           replay-window boundary, and the epoch key-generation
+                           evidence chain against APP_BASE_URL
 
 Exits 0 when every check passes, 1 otherwise, so `docker compose up
 --exit-code-from verify` reports the acceptance result as its status code.
@@ -46,6 +47,8 @@ def build_checks():
             html = fh.read()
         check("page contains audit form",
               all(token in html for token in ("audit_id", "traffic_secret", "records")))
+        check("page contains epoch evidence view",
+              all(token in html for token in ("epoch_select", "epoch_evidence")))
     except OSError as exc:
         check("page contains audit form", False, repr(exc))
 
@@ -100,7 +103,7 @@ def viol(row):
 
 # ------------------------------------------------------------------ smoke tests
 def smoke_tests():
-    from server.crypto import ratchet_secret
+    from server.crypto import ratchet_secret, secret_fingerprint
     from server.encode import key_update_record, seal_record
 
     print(f"[verify] HTTP smoke tests against {APP_BASE}")
@@ -226,6 +229,87 @@ def smoke_tests():
     check("length: kind and raw offset reported",
           status == 200 and fv.get("kind") == "length" and fv.get("offset") == 3,
           f"{status} {fv}")
+
+    # --- scenario E: epoch key-generation evidence chain and its refusals ---
+    secret5 = ratchet_secret(secret4)
+    ku_epoch3 = key_update_record(secret3, 3, 1, request_update=0)
+    forged_ku = bytearray(key_update_record(secret4, 4, 0, request_update=1))
+    forged_ku[-1] ^= 0x01  # corrupt the tag: a forged KeyUpdate
+    records = [
+        app(0, b"pre"),                      # 0: epoch 3 app data
+        ku_epoch3,                           # 1: KeyUpdate -> epoch 4 (edge)
+        ku_epoch3,                           # 2: duplicate capture, no edge
+        bytes(forged_ku),                    # 3: forged KeyUpdate, no edge
+        key_update_record(secret4, 4, 0, request_update=1),  # 4: -> epoch 5 (edge)
+        seal_record(secret5, 5, 0, b"post", 23),             # 5: epoch 5 app data
+        key_update_record(secret4, 4, 5),    # 6: old-epoch KeyUpdate, ignored
+    ]
+    status, v = post_audit("smoke-chain", secret_hex, records)
+    if status != 200:
+        check("chain: submission accepted", False, f"status {status}")
+    else:
+        recs = v["records"]
+        check("chain: only records #1 and #4 advanced the receive state",
+              recs[1]["key_update"] == "processed"
+              and recs[4]["key_update"] == "processed"
+              and recs[2]["replay"] == "duplicate"
+              and viol(recs[3]).get("kind") == "authentication"
+              and recs[6]["key_update"] == "ignored_old_epoch"
+              and v["final_state"]["current_epoch"] == 5
+              and v["final_state"]["ratchets"] == 2)
+        blob = json.dumps(v)
+        check("chain: verdict interfaces carry no lineage or secret material",
+              "key_lineage" not in v
+              and "secret_fingerprint" not in blob
+              and all(s.hex() not in blob for s in (secret3, secret4, secret5)))
+    status, ev = http("GET", "/api/audit/smoke-chain/epochs/5/evidence")
+    if status != 200 or not isinstance(ev, dict) or "chain" not in ev:
+        check("chain: epoch 5 evidence served", False, f"{status} {str(ev)[:200]}")
+    else:
+        chain = ev["chain"]
+        check("chain: three hops in advancement order from the initial epoch",
+              [h["epoch"] for h in chain] == [3, 4, 5]
+              and [h["order"] for h in chain] == [0, 1, 2]
+              and ev["established_epochs"] == [3, 4, 5])
+        check("chain: initial hop rooted at the initial traffic secret",
+              chain[0]["source"] == "initial_traffic_secret"
+              and chain[0]["record_index"] is None
+              and chain[0]["from_epoch"] is None)
+        check("chain: edges are exactly the authenticated advancing KeyUpdates",
+              [(h["source"], h["record_index"], h["from_epoch"], h["epoch"])
+               for h in chain[1:]]
+              == [("key_update", 1, 3, 4), ("key_update", 4, 4, 5)])
+        check("chain: per-epoch irreversible secret fingerprints",
+              [h["secret_fingerprint"] for h in chain]
+              == [secret_fingerprint(s) for s in (secret3, secret4, secret5)])
+        blob = json.dumps(ev)
+        check("chain: raw traffic secrets never appear in the evidence",
+              all(s.hex() not in blob for s in (secret3, secret4, secret5)))
+    status, ev4 = http("GET", "/api/audit/smoke-chain/epochs/4/evidence")
+    check("chain: epoch 4 evidence stops at its own hop",
+          status == 200 and [h["epoch"] for h in ev4["chain"]] == [3, 4],
+          f"status {status}")
+    status, ev3 = http("GET", "/api/audit/smoke-chain/epochs/3/evidence")
+    check("chain: initial epoch evidence is a single initial hop",
+          status == 200 and len(ev3["chain"]) == 1
+          and ev3["chain"][0]["source"] == "initial_traffic_secret",
+          f"status {status}")
+    status, _ = http("GET", "/api/audit/smoke-chain/epochs/6/evidence")
+    check("chain: never-established epoch refused", status == 404,
+          f"status {status}")
+    status, _ = http("GET", "/api/audit/smoke-chain/epochs/2/evidence")
+    check("chain: epoch outside this audit refused", status == 404,
+          f"status {status}")
+    status, _ = http("GET", "/api/audit/no-such-audit/epochs/3/evidence")
+    check("chain: unknown audit refused without leaking evidence",
+          status == 404, f"status {status}")
+    status, v = http("GET", "/api/audit/smoke-chain")
+    blob = json.dumps(v) if status == 200 else ""
+    check("chain: original read interface unchanged (no lineage, no secrets)",
+          status == 200 and "key_lineage" not in v
+          and "secret_fingerprint" not in blob
+          and all(s.hex() not in blob for s in (secret3, secret4, secret5)),
+          f"status {status}")
 
 
 def main():

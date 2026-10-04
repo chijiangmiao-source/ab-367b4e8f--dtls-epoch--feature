@@ -1,19 +1,26 @@
 """Review-rule tests: replay window adjudication, sequence recovery,
-KeyUpdate ratchet discipline, and violation offsets."""
+KeyUpdate ratchet discipline, key-generation lineage, and violation offsets."""
 import hashlib
+import json
 import unittest
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from server.crypto import derive_record_keys, ratchet_secret, record_nonce
+from server.crypto import (
+    derive_record_keys,
+    ratchet_secret,
+    record_nonce,
+    secret_fingerprint,
+)
 from server.dtls import (
     Receiver,
     ReplayWindow,
     Violation,
     parse_unified_header,
     reconstruct_seq,
+    run_audit,
 )
-from server.encode import key_update_record, seal_record
+from server.encode import handshake_message, key_update_record, seal_record
 
 SECRET3 = bytes(range(32))  # arbitrary 32-byte initial traffic secret
 
@@ -272,6 +279,116 @@ class ReceiverRuleTests(unittest.TestCase):
         row = rx.process_record(rec)
         self.assertEqual(row["violation"]["kind"], "authentication")
         self.assertIsNone(row["inner_type"])
+
+
+class KeyLineageRuleTests(unittest.TestCase):
+    """Generation evidence: only authenticated, state-advancing KeyUpdates
+    may appear as edges on an epoch's key-origin chain."""
+
+    def test_initial_hop_only_for_plain_appdata(self):
+        rx = Receiver(3, SECRET3)
+        rx.process_record(appdata(SECRET3, 3, 0, b"a"), record_index=0)
+        snap = rx.lineage_snapshot()
+        self.assertEqual(snap["initial_epoch"], 3)
+        self.assertEqual(snap["established_epochs"], [3])
+        self.assertEqual(len(snap["chain"]), 1)
+        hop = snap["chain"][0]
+        self.assertEqual(hop["order"], 0)
+        self.assertEqual(hop["source"], "initial_traffic_secret")
+        self.assertIsNone(hop["record_index"])
+        self.assertIsNone(hop["from_epoch"])
+        self.assertEqual(hop["secret_fingerprint"], secret_fingerprint(SECRET3))
+
+    def test_ratchet_appends_edge_with_record_index(self):
+        rx = Receiver(3, SECRET3)
+        rx.process_record(appdata(SECRET3, 3, 0, b"a"), record_index=0)
+        rx.process_record(key_update_record(SECRET3, 3, 1), record_index=1)
+        snap = rx.lineage_snapshot()
+        self.assertEqual(snap["established_epochs"], [3, 4])
+        edge = snap["chain"][1]
+        self.assertEqual(edge["order"], 1)
+        self.assertEqual(edge["source"], "key_update")
+        self.assertEqual(edge["record_index"], 1)
+        self.assertEqual(edge["from_epoch"], 3)
+        self.assertEqual(edge["epoch"], 4)
+        self.assertEqual(edge["secret_fingerprint"],
+                         secret_fingerprint(ratchet_secret(SECRET3)))
+
+    def test_continuous_two_hop_chain(self):
+        rx = Receiver(3, SECRET3)
+        secret4 = ratchet_secret(SECRET3)
+        secret5 = ratchet_secret(secret4)
+        rx.process_record(key_update_record(SECRET3, 3, 0), record_index=2)
+        rx.process_record(key_update_record(secret4, 4, 0), record_index=5)
+        snap = rx.lineage_snapshot()
+        self.assertEqual(snap["established_epochs"], [3, 4, 5])
+        self.assertEqual(
+            [(h["record_index"], h["from_epoch"], h["epoch"]) for h in snap["chain"]],
+            [(None, None, 3), (2, 3, 4), (5, 4, 5)])
+        self.assertEqual(
+            [h["secret_fingerprint"] for h in snap["chain"]],
+            [secret_fingerprint(s) for s in (SECRET3, secret4, secret5)])
+
+    def test_forged_duplicate_and_old_epoch_updates_leave_no_edge(self):
+        rx = Receiver(3, SECRET3)
+        ku = key_update_record(SECRET3, 3, 0)
+        rx.process_record(ku, record_index=0)            # -> epoch 4 (edge)
+        row = rx.process_record(ku, record_index=1)      # duplicate capture
+        self.assertEqual(row["replay"], "duplicate")
+        forged = bytearray(key_update_record(SECRET3, 3, 2))
+        forged[-1] ^= 1
+        row = rx.process_record(bytes(forged), record_index=2)  # auth failure
+        self.assertEqual(row["violation"]["kind"], "authentication")
+        row = rx.process_record(key_update_record(SECRET3, 3, 5), record_index=3)
+        self.assertEqual(row["key_update"], "ignored_old_epoch")  # no advance
+        snap = rx.lineage_snapshot()
+        self.assertEqual(snap["established_epochs"], [3, 4])
+        self.assertEqual([h["record_index"] for h in snap["chain"]], [None, 0])
+        self.assertEqual(rx.ratchets, 1)
+
+    def test_malformed_key_update_leaves_no_edge(self):
+        bad_hs = handshake_message(24, b"\x07\x08")  # invalid request_update
+        rec = seal_record(SECRET3, 3, 0, bad_hs, 22)
+        rx = Receiver(3, SECRET3)
+        row = rx.process_record(rec, record_index=0)
+        self.assertEqual(row["violation"]["kind"], "state")
+        self.assertEqual(rx.lineage_snapshot()["established_epochs"], [3])
+
+    def test_too_old_record_leaves_no_edge(self):
+        rx = Receiver(3, SECRET3)
+        rx.process_record(appdata(SECRET3, 3, 64, b"hi"), record_index=0)
+        row = rx.process_record(key_update_record(SECRET3, 3, 0), record_index=1)
+        self.assertEqual(row["replay"], "too_old")
+        self.assertEqual(rx.lineage_snapshot()["established_epochs"], [3])
+
+    def test_multiple_updates_in_one_record_share_record_index(self):
+        hs = handshake_message(24, b"\x00") + handshake_message(24, b"\x01")
+        rec = seal_record(SECRET3, 3, 0, hs, 22)
+        rx = Receiver(3, SECRET3)
+        row = rx.process_record(rec, record_index=7)
+        self.assertEqual(row["key_update"], "processed")
+        snap = rx.lineage_snapshot()
+        self.assertEqual(snap["established_epochs"], [3, 4, 5])
+        self.assertEqual([h["record_index"] for h in snap["chain"]], [None, 7, 7])
+
+    def test_lineage_never_contains_raw_secret(self):
+        rx = Receiver(3, SECRET3)
+        rx.process_record(key_update_record(SECRET3, 3, 0), record_index=0)
+        blob = json.dumps(rx.lineage_snapshot())
+        self.assertNotIn(SECRET3.hex(), blob)
+        self.assertNotIn(ratchet_secret(SECRET3).hex(), blob)
+
+    def test_run_audit_freezes_lineage_with_record_indexes(self):
+        blobs = [
+            appdata(SECRET3, 3, 0, b"a"),
+            key_update_record(SECRET3, 3, 1),
+            appdata(ratchet_secret(SECRET3), 4, 0, b"post"),
+        ]
+        result = run_audit(3, SECRET3, blobs)
+        self.assertEqual([r["index"] for r in result["records"]], [0, 1, 2])
+        chain = result["key_lineage"]["chain"]
+        self.assertEqual([h["record_index"] for h in chain], [None, 1])
+        self.assertEqual(result["key_lineage"]["established_epochs"], [3, 4])
 
 
 if __name__ == "__main__":

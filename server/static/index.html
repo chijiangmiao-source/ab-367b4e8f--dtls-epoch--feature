@@ -21,6 +21,9 @@
   input, textarea { width: 100%; background: #0b1226; color: #dbe4ff;
                     border: 1px solid #33406b; border-radius: 6px; padding: 8px;
                     font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  select { width: 100%; background: #0b1226; color: #dbe4ff;
+           border: 1px solid #33406b; border-radius: 6px; padding: 8px;
+           font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
   textarea { min-height: 150px; resize: vertical; }
   button { margin-top: 12px; background: #2f6fed; color: #fff; border: 0;
            border-radius: 6px; padding: 9px 18px; cursor: pointer; font-size: 13px; }
@@ -46,6 +49,13 @@
   .tag.fail { background: #33131c; color: #ffb3c0; }
   .tag.skip { background: #1a1f2e; color: #7f8db3; }
   .tag.okb  { background: #0f2f1e; color: #8ff0b8; }
+  #epoch-block { margin-top: 16px; }
+  #epoch-block h2 { font-size: 14px; color: #9db4e8; margin: 0 0 8px; }
+  #epoch-block .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  #epoch-block .controls > div { min-width: 200px; }
+  #epoch-block .hint { font-size: 11.5px; color: #6f80ab; margin: 8px 0 0; }
+  #epoch_evidence { margin-top: 10px; }
+  #epoch_evidence td.fp { word-break: break-all; }
 </style>
 </head>
 <body>
@@ -101,6 +111,25 @@
       <tbody id="v-rows"></tbody>
     </table>
   </div>
+
+  <div id="epoch-block">
+    <h2>世代证据 · epoch 接收密钥来源</h2>
+    <div class="controls">
+      <div>
+        <label for="epoch_select">选择已出现的 epoch</label>
+        <select id="epoch_select"></select>
+      </div>
+      <div>
+        <label for="epoch_manual">或输入任意 epoch（核对拒绝边界）</label>
+        <input id="epoch_manual" type="number" min="0" max="65535" placeholder="0–65535">
+      </div>
+      <div><button id="epoch_query" style="margin-top:0">查询世代证据</button></div>
+    </div>
+    <p class="hint">只有认证成功且实际推进接收状态的 KeyUpdate 才会成为链上的边；认证失败、
+      重复、过旧或旧 epoch 的同类记录即使内容相似也不会进入证据链。指纹为 SHA-256 不可逆摘要，
+      原始 traffic secret 不出现在任何响应或页面中。</p>
+    <div id="epoch_evidence"></div>
+  </div>
 </section>
 
 <script>
@@ -109,12 +138,15 @@ const KIND_ZH = {truncation: "截断", length: "长度", authentication: "认证
 const REPLAY_ZH = {new: "新到", duplicate: "重复", too_old: "过旧"};
 const AUTH_ZH = {ok: "通过", failed: "失败", skipped: "跳过"};
 
+// 当前页面上已渲染裁决所属的审计标识（世代证据查询的上下文）
+let currentAuditId = null;
+
 function esc(s) {
   return String(s).replace(/[&<>"]/g,
     c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 }
 
-// 渲染新结果前清空旧成功证据
+// 渲染新结果前清空旧成功证据（含世代证据视图）
 function clearResult() {
   $("result").hidden = true;
   $("v-banner").className = "banner";
@@ -123,6 +155,10 @@ function clearResult() {
   $("v-rows").innerHTML = "";
   $("v-audit").textContent = "";
   $("v-created").textContent = "";
+  currentAuditId = null;
+  $("epoch_select").innerHTML = "";
+  $("epoch_manual").value = "";
+  $("epoch_evidence").innerHTML = "";
 }
 
 function showError(msg) {
@@ -187,8 +223,105 @@ function renderVerdict(v) {
       `<td>${digest}</td><td>${win}</td><td>${viol}</td></tr>`;
   }).join("");
   $("v-rows").innerHTML = rows;
+  currentAuditId = v.audit_id;
+  primeEpochSelect(v.audit_id, v.initial_epoch, v.final_state.current_epoch);
   $("result").hidden = false;
   $("result").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+// 用真实 API 取回该冻结审计已建立的 epoch 列表，填充选择器；
+// 失败时退化为按 initial..current 连续区间填充。
+async function primeEpochSelect(auditId, initialEpoch, currentEpoch) {
+  const sel = $("epoch_select");
+  sel.innerHTML = "";
+  let epochs = null;
+  try {
+    const resp = await fetch("/api/audit/" + encodeURIComponent(auditId) +
+      "/epochs/" + currentEpoch + "/evidence");
+    if (resp.ok) {
+      const data = await resp.json();
+      if (Array.isArray(data.established_epochs)) epochs = data.established_epochs;
+    }
+  } catch (e) { /* 退化逻辑见下 */ }
+  if (currentAuditId !== auditId) return;  // 页面已渲染更新的裁决，放弃过期结果
+  if (!epochs) {
+    epochs = [];
+    for (let e = initialEpoch; e <= currentEpoch && epochs.length < 1000; e++)
+      epochs.push(e);
+  }
+  for (const e of epochs) {
+    const opt = document.createElement("option");
+    opt.value = String(e);
+    opt.textContent = "epoch " + e +
+      (e === initialEpoch ? "（初始 traffic secret）" : "（KeyUpdate 建立）");
+    sel.appendChild(opt);
+  }
+  sel.value = String(currentEpoch);
+}
+
+function showEpochRefusal(msg) {
+  $("epoch_evidence").innerHTML =
+    `<div class="banner bad">拒绝：${esc(msg)}</div>`;
+}
+
+function renderEpochEvidence(ev) {
+  const last = ev.chain[ev.chain.length - 1];
+  const origin = last.source === "initial_traffic_secret"
+    ? `epoch ${ev.epoch} 的接收密钥直接源于初始 traffic secret（未经任何 KeyUpdate 推进）。`
+    : `epoch ${ev.epoch} 的接收密钥源于记录 #${last.record_index} 中已认证并实际推进状态的 ` +
+      `KeyUpdate（epoch ${last.from_epoch} → ${last.epoch}）。`;
+  const rows = ev.chain.map(h => {
+    const src = h.source === "initial_traffic_secret"
+      ? "初始 traffic secret"
+      : `KeyUpdate · 记录 #${h.record_index}`;
+    const span = (h.from_epoch === null ? "—" : "epoch " + h.from_epoch) +
+      ` → epoch ${h.epoch}`;
+    return `<tr><td>${h.order}</td><td>${h.epoch}</td><td>${esc(src)}</td>` +
+      `<td>${h.record_index === null ? "—" : h.record_index}</td>` +
+      `<td>${esc(span)}</td><td class="fp">${esc(h.secret_fingerprint)}</td></tr>`;
+  }).join("");
+  $("epoch_evidence").innerHTML =
+    `<div class="banner ok">${esc(origin)}</div>` +
+    `<div class="final">已建立 epoch：${ev.established_epochs.join(" → ")}\n` +
+    `证据链仅含认证成功且实际推进接收状态的 KeyUpdate；指纹为不可逆 SHA-256 摘要，原始 traffic secret 不在任何响应中。</div>` +
+    `<div class="tablewrap"><table><thead><tr>` +
+    `<th>推进顺序</th><th>epoch</th><th>来源</th><th>建立记录 #</th>` +
+    `<th>前后 epoch</th><th>secret 指纹 (SHA-256)</th>` +
+    `</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+async function queryEpochEvidence() {
+  $("epoch_evidence").innerHTML = "";
+  if (!currentAuditId) {
+    showEpochRefusal("请先提交或重新打开一份冻结裁决。");
+    return;
+  }
+  const manual = $("epoch_manual").value.trim();
+  const chosen = manual !== "" ? manual : $("epoch_select").value;
+  if (chosen === "") {
+    showEpochRefusal("请选择或输入一个 epoch。");
+    return;
+  }
+  const epoch = Number(chosen);
+  if (!Number.isInteger(epoch) || epoch < 0 || epoch > 65535) {
+    showEpochRefusal("epoch 须为 0–65535 的整数。");
+    return;
+  }
+  let resp;
+  try {
+    resp = await fetch("/api/audit/" + encodeURIComponent(currentAuditId) +
+      "/epochs/" + epoch + "/evidence");
+  } catch (e) {
+    showEpochRefusal("网络错误：" + e);
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    showEpochRefusal(`epoch ${epoch} — ` +
+      (data && data.detail ? data.detail : "HTTP " + resp.status));
+    return;
+  }
+  renderEpochEvidence(data);
 }
 
 async function submitAudit() {
@@ -246,6 +379,8 @@ async function reopenAudit() {
 
 $("submit").addEventListener("click", submitAudit);
 $("reopen").addEventListener("click", reopenAudit);
+$("epoch_query").addEventListener("click", queryEpochEvidence);
+$("epoch_select").addEventListener("change", () => { $("epoch_manual").value = ""; });
 </script>
 </body>
 </html>
